@@ -1,4 +1,5 @@
 # encoding=utf-8
+import io
 import time
 from typing import Optional
 
@@ -185,3 +186,57 @@ def test_live_empty() -> None:
     print(repr(result))
     assert "\n" not in result
     assert result == "\x1b[?25l\r\x1b[2K\x1b[?25h\r"
+
+
+def _refresh_thread_console():
+    return Console(
+        file=io.StringIO(),
+        width=40,
+        force_terminal=True,
+        legacy_windows=False,
+        color_system="truecolor",
+        _environ={},
+    )
+
+
+def test_live_refresh_quiet_still_emits_control_codes() -> None:
+    # The refresh thread must read the live render mode stack top on every
+    # refresh: quiet discards the frame text but never the control codes.
+    console = _refresh_thread_console()
+    live = Live(
+        Text("secret frame text"),
+        console=console,
+        auto_refresh=True,
+        refresh_per_second=100,
+    )
+    with console.use_render_mode(quiet=True):
+        live.start()
+        time.sleep(0.5)
+        live.stop()
+    output = console.file.getvalue()
+    assert "secret frame text" not in output
+    # Cursor hide / erase / movement control sequences are still present.
+    assert "\x1b[" in output
+
+
+def test_live_refresh_reads_pushed_no_color_without_restart() -> None:
+    # Pushing a mode after the Live has started affects subsequent refreshes
+    # from the existing refresh thread (the mode is not frozen at start).
+    console = _refresh_thread_console()
+    live = Live(
+        Text("colored frame", style="bold red"),
+        console=console,
+        auto_refresh=True,
+        refresh_per_second=100,
+    )
+    live.start()
+    time.sleep(0.4)
+    console.file = io.StringIO()
+    with console.use_render_mode(no_color=True):
+        time.sleep(0.5)
+        live.stop()
+    output = console.file.getvalue()
+    # Bold survives no_color; the red foreground does not.
+    assert "\x1b[1m" in output
+    assert "\x1b[31m" not in output
+    assert "\x1b[91m" not in output

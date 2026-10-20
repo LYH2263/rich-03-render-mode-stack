@@ -1,6 +1,7 @@
 import datetime
 import io
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -1133,3 +1134,308 @@ def test_tty_compatible() -> None:
     assert not console.is_terminal
     # Should not have auto-detected
     assert not console.file.called_isatty
+
+
+# ---------------------------------------------------------------------------
+# Render mode stack
+# ---------------------------------------------------------------------------
+
+TERMINAL_KWARGS = dict(
+    file=None,
+    force_terminal=True,
+    color_system="truecolor",
+    legacy_windows=False,
+    _environ={},
+)
+
+
+def _terminal_console(**kwargs):
+    options = dict(TERMINAL_KWARGS)
+    options.update(kwargs)
+    options["file"] = io.StringIO()
+    return Console(**options)
+
+
+def test_render_mode_defaults() -> None:
+    console = Console(file=io.StringIO())
+    assert console.no_color is False
+    assert console.quiet is False
+    assert console.soft_wrap is False
+
+
+def test_render_mode_constructor_values() -> None:
+    console = Console(file=io.StringIO(), no_color=True, quiet=True, soft_wrap=True)
+    assert console.no_color is True
+    assert console.quiet is True
+    assert console.soft_wrap is True
+
+
+def test_render_mode_push_pop_and_inheritance() -> None:
+    console = _terminal_console(no_color=True)
+    assert console.no_color is True and console.quiet is False
+    console.push_render_mode(quiet=True)
+    # Arguments left as None inherit the current top of stack.
+    assert console.no_color is True and console.quiet is True
+    console.push_render_mode(no_color=False, quiet=False)
+    assert console.no_color is False and console.quiet is False
+    console.pop_render_mode()
+    assert console.no_color is True and console.quiet is True
+    console.pop_render_mode()
+    assert console.no_color is True and console.quiet is False
+
+
+def test_render_mode_pop_base_raises() -> None:
+    from rich.console import RenderModeStackError
+
+    console = Console(file=io.StringIO())
+    with pytest.raises(RenderModeStackError):
+        console.pop_render_mode()
+
+
+def test_render_mode_context_restores_on_exception() -> None:
+    console = _terminal_console()
+    with pytest.raises(RuntimeError):
+        with console.use_render_mode(no_color=True, quiet=True, soft_wrap=True):
+            assert (
+                console.no_color is True
+                and console.quiet is True
+                and console.soft_wrap is True
+            )
+            raise RuntimeError("boom")
+    assert (
+        console.no_color is False
+        and console.quiet is False
+        and console.soft_wrap is False
+    )
+
+
+def test_render_mode_setters_affect_top_only() -> None:
+    console = _terminal_console(no_color=True)
+    console.push_render_mode(quiet=True)
+    # Direct assignment mutates the current top of stack in place.
+    console.quiet = False
+    console.no_color = False
+    assert console.quiet is False and console.no_color is False
+    console.pop_render_mode()
+    # The base entry is untouched by assignments inside the pushed frame.
+    assert console.quiet is False and console.no_color is True
+
+
+def test_render_mode_independent_from_theme_stack() -> None:
+    from rich.theme import Theme
+
+    console = Console(
+        file=io.StringIO(),
+        theme=Theme({"custom": "red"}),
+        color_system="truecolor",
+        force_terminal=True,
+        legacy_windows=False,
+        _environ={},
+    )
+    with console.use_theme(Theme({"custom": "blue"})):
+        with console.use_render_mode(no_color=True):
+            with console.use_theme(Theme({"custom": "green"})):
+                with console.use_render_mode(quiet=True):
+                    assert console.get_style("custom").color.name == "green"
+                    assert console.no_color is True and console.quiet is True
+                # The mode stack pops independently of the theme stack.
+                assert console.quiet is False and console.no_color is True
+                assert console.get_style("custom").color.name == "green"
+            assert console.get_style("custom").color.name == "blue"
+        assert console.no_color is False
+    assert console.get_style("custom").color.name == "red"
+
+
+def test_render_mode_quiet_discards_ordinary_output() -> None:
+    console = _terminal_console()
+    with console.use_render_mode(quiet=True):
+        console.print("nothing should be written")
+    assert console.file.getvalue() == ""
+    console.print("written again")
+    assert console.file.getvalue() == "written again\n"
+
+
+def test_render_mode_quiet_keeps_live_control_codes() -> None:
+    console = _terminal_console()
+    with console.use_render_mode(quiet=True):
+        console.print("discarded text")
+        # The control codes Live relies on must still reach the terminal.
+        console.control(Control.move_to(5, 2))
+    assert console.file.getvalue() == "\x1b[3;6H"
+
+
+def test_render_mode_quiet_does_not_record() -> None:
+    console = _terminal_console(record=True)
+    console.print("visible")
+    with console.use_render_mode(quiet=True):
+        console.print("hidden")
+    assert console.export_text(clear=False) == "visible\n"
+    output = console.file.getvalue()
+    assert "visible" in output and "hidden" not in output
+
+
+def test_render_mode_quiet_jupyter_still_displays() -> None:
+    import rich.jupyter as jupyter
+
+    captured = {}
+
+    def fake_display(segments, text):
+        captured["segments"] = list(segments)
+        captured["text"] = text
+
+    console = Console(force_jupyter=True)
+    with mock.patch.object(jupyter, "display", fake_display):
+        with console.use_render_mode(quiet=True):
+            console.print("[red]jupyter quiet[/]")
+
+    ansi_stripped = re.sub(r"\x1b\[[0-9;]*m", "", captured["text"])
+    assert ansi_stripped == "jupyter quiet\n"
+    html = jupyter._render_segments(captured["segments"])
+    assert "<span" in html and "jupyter quiet" in html
+
+
+def test_render_mode_no_color_write_layer() -> None:
+    console = _terminal_console()
+    with console.use_render_mode(no_color=True):
+        console.print("[bold magenta on red]FOO[/]")
+    # Colors are stripped at the write layer; bold survives.
+    assert console.file.getvalue() == "\x1b[1mFOO\x1b[0m\n"
+
+
+def test_render_mode_no_color_progress_bar_pulse() -> None:
+    from rich.progress_bar import ProgressBar
+
+    console = _terminal_console()
+    options = console.options.update_width(20)
+    bar = ProgressBar(total=None, width=20, animation_time=0.0)
+
+    with console.use_render_mode(no_color=True):
+        plain = "".join(segment.text for segment in console.render(bar, options))
+    # The pulse takes its existing no-color character path: half spaces.
+    assert plain == "━" * 10 + " " * 10
+
+    colored = "".join(segment.text for segment in console.render(bar, options))
+    assert colored == "━" * 20
+
+    with console.use_render_mode(no_color=True):
+        console.print(bar)
+    written = console.file.getvalue()
+    assert "38;2" not in written and "48;2" not in written
+
+
+def test_render_mode_no_color_syntax() -> None:
+    pytest.importorskip("pygments")
+    from rich.syntax import Syntax
+
+    console = _terminal_console(width=60)
+    with console.use_render_mode(no_color=True):
+        console.print(Syntax('print("hello")\n', "python", line_numbers=False))
+    output = console.file.getvalue()
+    assert "38;2" not in output and "48;2" not in output
+    assert "print" in output
+
+
+def test_render_mode_no_color_traceback() -> None:
+    from rich.traceback import Traceback
+
+    console = _terminal_console(width=80)
+    try:
+        raise ValueError("a quiet boom")
+    except ValueError:
+        traceback = Traceback()
+    with console.use_render_mode(no_color=True):
+        console.print(traceback)
+    output = console.file.getvalue()
+    assert "38;2" not in output and "48;2" not in output
+    assert "ValueError" in output and "a quiet boom" in output
+
+
+def test_render_mode_soft_wrap_print() -> None:
+    console = Console(file=io.StringIO(), width=10)
+    with console.use_render_mode(soft_wrap=True):
+        console.print("foo bar baz egg")
+    assert console.file.getvalue() == "foo bar baz egg\n"
+
+
+def test_render_mode_soft_wrap_log() -> None:
+    console = Console(
+        file=io.StringIO(),
+        width=10,
+        log_time=False,
+        log_path=False,
+        color_system=None,
+    )
+    console.log("foo bar baz egg")
+    assert console.file.getvalue() == "foo bar   \nbaz egg   \n"
+    with console.use_render_mode(soft_wrap=True):
+        console.log("foo bar baz egg")
+    assert console.file.getvalue().endswith("foo bar baz egg\n")
+    # The full line appears on a single logical line, never cropped.
+    assert "foo bar baz egg\n" in console.file.getvalue()
+
+
+def test_render_mode_soft_wrap_log_prefixes_preserved() -> None:
+    console = Console(
+        file=io.StringIO(),
+        width=20,
+        color_system=None,
+        log_time_format="[%X]",
+        log_path=False,
+    )
+    with console.use_render_mode(soft_wrap=True):
+        console.log("the log message")
+    output = console.file.getvalue()
+    assert output.endswith("the log message\n")
+    assert output.startswith("[")
+    assert "the log message" in output
+
+
+def test_render_mode_markup_and_highlight_unaffected() -> None:
+    console = _terminal_console()
+    with console.use_render_mode(no_color=True, quiet=True, soft_wrap=True):
+        pass
+    # Leaving the mode restores markup rendering completely.
+    console.print("[bold red]x[/]")
+    output = console.file.getvalue()
+    assert "\x1b[1;31mx\x1b[0m\n" == output
+
+
+def test_render_mode_file_proxy_inherits_stack_top() -> None:
+    from rich.file_proxy import FileProxy
+
+    console = _terminal_console()
+    proxy = FileProxy(console, console.file)
+    with console.use_render_mode(quiet=True):
+        proxy.write("silent line\n")
+    assert console.file.getvalue() == ""
+    # Proxy hands already-decoded styled Text to the console; bracket text is
+    # not re-parsed as markup.
+    proxy.write("[red]literal brackets[/red]\n")
+    assert console.file.getvalue() == "[red]literal brackets[/red]\n"
+    # ANSI decoded by the proxy is styled Text, decolored at the write layer.
+    with console.use_render_mode(no_color=True):
+        proxy.write("\x1b[31mred via ansi\x1b[0m\n")
+    assert console.file.getvalue().endswith("red via ansi\n")
+    assert "\x1b[31m" not in console.file.getvalue()
+
+
+def test_render_mode_rich_handler_inherits_stack_top() -> None:
+    import logging
+
+    from rich.logging import RichHandler
+
+    console = _terminal_console(width=200)
+    handler = RichHandler(console=console, enable_link_path=False, markup=True)
+    logger = logging.getLogger("render_mode_handler_test")
+    logger.handlers = [handler]
+    logger.setLevel("INFO")
+    logger.propagate = False
+
+    with console.use_render_mode(no_color=True):
+        logger.info("[red]a handler message[/]")
+    output_no_color = console.file.getvalue()
+    assert "a handler message" in output_no_color
+    assert "\x1b[31m" not in output_no_color
+
+    logger.info("[red]a handler message[/]")
+    assert "\x1b[31m" in console.file.getvalue()

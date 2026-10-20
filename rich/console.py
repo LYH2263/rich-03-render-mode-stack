@@ -2,7 +2,7 @@ import os
 import sys
 import threading
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from functools import wraps
 from itertools import islice
@@ -277,6 +277,29 @@ class CaptureError(Exception):
     """An error in the Capture context manager."""
 
 
+class RenderModeStackError(Exception):
+    """An error in the render mode stack."""
+
+
+@dataclass(frozen=True)
+class RenderMode:
+    """A set of render switches managed by the Console render mode stack.
+
+    The render mode stack is independent from the theme stack. It holds only
+    output switches; markup and highlighter settings deliberately live outside
+    of it.
+
+    Attributes:
+        no_color: Disable color (but not other styles) when writing output.
+        quiet: Discard output destined for ordinary terminal/file writes.
+        soft_wrap: Disable the default wrapping and cropping in print and log.
+    """
+
+    no_color: bool = False
+    quiet: bool = False
+    soft_wrap: bool = False
+
+
 class NewLine:
     """A renderable to generate new line(s)"""
 
@@ -359,6 +382,38 @@ class ThemeContext:
         exc_tb: Optional[TracebackType],
     ) -> None:
         self.console.pop_theme()
+
+
+class RenderModeContext:
+    """A context manager to temporarily change render modes.
+    See :meth:`~rich.console.Console.use_render_mode` for usage."""
+
+    def __init__(
+        self,
+        console: "Console",
+        *,
+        no_color: Optional[bool] = None,
+        quiet: Optional[bool] = None,
+        soft_wrap: Optional[bool] = None,
+    ) -> None:
+        self.console = console
+        self.no_color = no_color
+        self.quiet = quiet
+        self.soft_wrap = soft_wrap
+
+    def __enter__(self) -> "RenderModeContext":
+        self.console.push_render_mode(
+            no_color=self.no_color, quiet=self.quiet, soft_wrap=self.soft_wrap
+        )
+        return self
+
+    def __exit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[TracebackType],
+    ) -> None:
+        self.console.pop_render_mode()
 
 
 class PagerContext:
@@ -654,6 +709,11 @@ class Console:
         if _environ is not None:
             self._environ = _environ
 
+        # The render mode stack is shared by all threads, so e.g. a Live
+        # refresh thread always renders with the modes currently in effect.
+        # The bottom entry holds the construction time values.
+        self._render_mode_stack: List[RenderMode] = [RenderMode()]
+
         self.is_jupyter = _is_jupyter() if force_jupyter is None else force_jupyter
         if self.is_jupyter:
             if width is None:
@@ -786,6 +846,63 @@ class Console:
         """Get the thread local theme stack."""
         return self._thread_locals.theme_stack
 
+    @property
+    def _render_mode(self) -> RenderMode:
+        """Get the render mode at the top of the stack."""
+        return self._render_mode_stack[-1]
+
+    @property
+    def no_color(self) -> bool:
+        """Check if color output is disabled.
+
+        Reads the current top of the render mode stack, which is the value
+        passed to the constructor until a render mode is pushed.
+
+        Returns:
+            bool: True if color should be removed when writing output.
+        """
+        return self._render_mode.no_color
+
+    @no_color.setter
+    def no_color(self, no_color: bool) -> None:
+        """Set no_color on the current render mode (top of stack)."""
+        self._render_mode_stack[-1] = replace(self._render_mode, no_color=no_color)
+
+    @property
+    def quiet(self) -> bool:
+        """Check if ordinary output is suppressed.
+
+        Reads the current top of the render mode stack, which is the value
+        passed to the constructor until a render mode is pushed.
+
+        Returns:
+            bool: True if output destined for ordinary terminal/file writes
+                is discarded (control codes and Jupyter displays excepted).
+        """
+        return self._render_mode.quiet
+
+    @quiet.setter
+    def quiet(self, quiet: bool) -> None:
+        """Set quiet on the current render mode (top of stack)."""
+        self._render_mode_stack[-1] = replace(self._render_mode, quiet=quiet)
+
+    @property
+    def soft_wrap(self) -> bool:
+        """Check if soft wrapping is enabled.
+
+        Reads the current top of the render mode stack, which is the value
+        passed to the constructor until a render mode is pushed.
+
+        Returns:
+            bool: True if print and log skip their default wrapping/cropping.
+        """
+        return self._render_mode.soft_wrap
+
+    @soft_wrap.setter
+    def soft_wrap(self, soft_wrap: bool) -> None:
+        """Set soft_wrap on the current render mode (top of stack)."""
+        self._render_mode_stack[-1] = replace(self._render_mode, soft_wrap=soft_wrap)
+
     def _detect_color_system(self) -> Optional[ColorSystem]:
         """Detect color system from env vars."""
         if self.is_jupyter:
@@ -904,6 +1021,81 @@ class Console:
             ThemeContext: [description]
         """
         return ThemeContext(self, theme, inherit)
+
+    def push_render_mode(
+        self,
+        *,
+        no_color: Optional[bool] = None,
+        quiet: Optional[bool] = None,
+        soft_wrap: Optional[bool] = None,
+    ) -> None:
+        """Push a new :class:`~rich.console.RenderMode` on to the render mode stack.
+
+        The render mode stack is independent of the theme stack. Any argument
+        left as ``None`` inherits the value from the current top of the stack.
+        Generally speaking, you should call
+        :meth:`~rich.console.Console.use_render_mode` to get a context manager,
+        rather than calling this method directly.
+
+        Args:
+            no_color (Optional[bool], optional): Disable color at the write layer.
+            quiet (Optional[bool], optional): Discard ordinary terminal/file output.
+            soft_wrap (Optional[bool], optional): Disable default wrapping and
+                cropping in print and log.
+        """
+        with self._lock:
+            mode = replace(
+                self._render_mode_stack[-1],
+                **{
+                    key: value
+                    for key, value in (
+                        ("no_color", no_color),
+                        ("quiet", quiet),
+                        ("soft_wrap", soft_wrap),
+                    )
+                    if value is not None
+                },
+            )
+            self._render_mode_stack.append(mode)
+
+    def pop_render_mode(self) -> None:
+        """Remove a render mode from top of stack, restoring the previous mode."""
+        with self._lock:
+            if len(self._render_mode_stack) == 1:
+                raise RenderModeStackError("Unable to pop base render mode")
+            self._render_mode_stack.pop()
+
+    def use_render_mode(
+        self,
+        *,
+        no_color: Optional[bool] = None,
+        quiet: Optional[bool] = None,
+        soft_wrap: Optional[bool] = None,
+    ) -> RenderModeContext:
+        """Temporarily change render modes for the duration of a context manager.
+
+        Only the supplied switches are changed; the rest are inherited from the
+        current top of the stack. May be nested and cross-nested with
+        :meth:`~rich.console.Console.use_theme`; each stack pops independently.
+
+        Example:
+            >>> console = Console()
+            >>> with console.use_render_mode(no_color=True):
+            ...     console.print("[bold magenta]Hello World[/]")
+
+        Args:
+            no_color (Optional[bool], optional): Disable color at the write layer.
+            quiet (Optional[bool], optional): Discard ordinary terminal/file output.
+            soft_wrap (Optional[bool], optional): Disable default wrapping and
+                cropping in print and log.
+
+        Returns:
+            RenderModeContext: A context manager which pops the mode on exit,
+                even if an exception is raised.
+        """
+        return RenderModeContext(
+            self, no_color=no_color, quiet=quiet, soft_wrap=soft_wrap
+        )
 
     @property
     def color_system(self) -> Optional[str]:
@@ -2018,14 +2210,22 @@ class Console:
             new_segments: List[Segment] = []
             extend = new_segments.extend
             render = self.render
-            render_options = self.options
+            soft_wrap = self.soft_wrap
+            if soft_wrap:
+                # Soft wrap disables the default word wrapping and cropping.
+                render_options = self.options.update(no_wrap=True, overflow="ignore")
+            else:
+                render_options = self.options
             for renderable in renderables:
                 extend(render(renderable, render_options))
-            buffer_extend = self._buffer.extend
-            for line in Segment.split_and_crop_lines(
-                new_segments, self.width, pad=False
-            ):
-                buffer_extend(line)
+            if soft_wrap:
+                self._buffer.extend(new_segments)
+            else:
+                buffer_extend = self._buffer.extend
+                for line in Segment.split_and_crop_lines(
+                    new_segments, self.width, pad=False
+                ):
+                    buffer_extend(line)
 
     def on_broken_pipe(self) -> None:
         """This function is called when a `BrokenPipeError` is raised.
@@ -2042,15 +2242,17 @@ class Console:
         raise SystemExit(1)
 
     def _check_buffer(self) -> None:
-        """Check if the buffer may be rendered. Render it if it can (e.g. Console.quiet is False)
-        Rendering is supported on Windows, Unix and Jupyter environments. For
-        legacy Windows consoles, the win32 API is called directly.
-        This method will also record what it renders if recording is enabled via Console.record.
-        """
-        if self.quiet:
-            del self._buffer[:]
-            return
+        """Check if the buffer may be rendered, and render it if so.
 
+        The render mode at the top of the render mode stack decides what
+        "rendering" means for each output: ``quiet`` discards content destined
+        for ordinary terminal/file writes but never suppresses control codes
+        (Live refreshes still need them) or Jupyter mimebundles. Rendering is
+        supported on Windows, Unix and Jupyter environments. For legacy
+        Windows consoles, the win32 API is called directly.
+        This method will also record what it renders if recording is enabled
+        via Console.record (but not while ``quiet`` is set).
+        """
         try:
             self._write_buffer()
         except BrokenPipeError:
@@ -2060,7 +2262,9 @@ class Console:
         """Write the buffer to the output file."""
 
         with self._lock:
-            if self.record and not self._buffer_index:
+            # Recording reflects what would have been written to an ordinary
+            # terminal/file: nothing is recorded while quiet, as before.
+            if self.record and not self._buffer_index and not self.quiet:
                 with self._record_buffer_lock:
                     self._record_buffer.extend(self._buffer[:])
 
@@ -2068,66 +2272,79 @@ class Console:
                 if self.is_jupyter:  # pragma: no cover
                     from .jupyter import display
 
+                    # Jupyter always receives the full mimebundle (HTML plus
+                    # plain text), even while quiet.
                     display(self._buffer, self._render_buffer(self._buffer[:]))
                     del self._buffer[:]
-                else:
-                    if WINDOWS:
-                        use_legacy_windows_render = False
-                        if self.legacy_windows:
-                            fileno = get_fileno(self.file)
-                            if fileno is not None:
-                                use_legacy_windows_render = (
-                                    fileno in _STD_STREAMS_OUTPUT
-                                )
+                    return
 
-                        if use_legacy_windows_render:
-                            from rich._win32_console import LegacyWindowsTerm
-                            from rich._windows_renderer import legacy_windows_render
+                render_buffer: List[Segment] = self._buffer[:]
+                del self._buffer[:]
 
-                            buffer = self._buffer[:]
-                            if self.no_color and self._color_system:
-                                buffer = list(Segment.remove_color(buffer))
+                if self.quiet:
+                    # Discard ordinary output, but control codes (e.g. the
+                    # cursor moves emitted by Live refreshes) must still reach
+                    # the terminal.
+                    render_buffer = [
+                        segment for segment in render_buffer if segment.control
+                    ]
+                    if not render_buffer:
+                        return
 
-                            legacy_windows_render(buffer, LegacyWindowsTerm(self.file))
-                        else:
-                            # Either a non-std stream on legacy Windows, or modern Windows.
-                            text = self._render_buffer(self._buffer[:])
-                            # https://bugs.python.org/issue37871
-                            # https://github.com/python/cpython/issues/82052
-                            # We need to avoid writing more than 32Kb in a single write, due to the above bug
-                            write = self.file.write
-                            # Worse case scenario, every character is 4 bytes of utf-8
-                            MAX_WRITE = 32 * 1024 // 4
-                            try:
-                                if len(text) <= MAX_WRITE:
-                                    write(text)
-                                else:
-                                    batch: List[str] = []
-                                    batch_append = batch.append
-                                    size = 0
-                                    for line in text.splitlines(True):
-                                        if size + len(line) > MAX_WRITE and batch:
-                                            write("".join(batch))
-                                            batch.clear()
-                                            size = 0
-                                        batch_append(line)
-                                        size += len(line)
-                                    if batch:
+                if WINDOWS:
+                    use_legacy_windows_render = False
+                    if self.legacy_windows:
+                        fileno = get_fileno(self.file)
+                        if fileno is not None:
+                            use_legacy_windows_render = fileno in _STD_STREAMS_OUTPUT
+
+                    if use_legacy_windows_render:
+                        from rich._win32_console import LegacyWindowsTerm
+                        from rich._windows_renderer import legacy_windows_render
+
+                        buffer = render_buffer
+                        if self.no_color and self._color_system:
+                            buffer = list(Segment.remove_color(buffer))
+
+                        legacy_windows_render(buffer, LegacyWindowsTerm(self.file))
+                    else:
+                        # Either a non-std stream on legacy Windows, or modern Windows.
+                        text = self._render_buffer(render_buffer)
+                        # https://bugs.python.org/issue37871
+                        # https://github.com/python/cpython/issues/82052
+                        # We need to avoid writing more than 32Kb in a single write, due to the above bug
+                        write = self.file.write
+                        # Worse case scenario, every character is 4 bytes of utf-8
+                        MAX_WRITE = 32 * 1024 // 4
+                        try:
+                            if len(text) <= MAX_WRITE:
+                                write(text)
+                            else:
+                                batch: List[str] = []
+                                batch_append = batch.append
+                                size = 0
+                                for line in text.splitlines(True):
+                                    if size + len(line) > MAX_WRITE and batch:
                                         write("".join(batch))
                                         batch.clear()
-                            except UnicodeEncodeError as error:
-                                error.reason = f"{error.reason}\n*** You may need to add PYTHONIOENCODING=utf-8 to your environment ***"
-                                raise
-                    else:
-                        text = self._render_buffer(self._buffer[:])
-                        try:
-                            self.file.write(text)
+                                        size = 0
+                                    batch_append(line)
+                                    size += len(line)
+                                if batch:
+                                    write("".join(batch))
+                                    batch.clear()
                         except UnicodeEncodeError as error:
                             error.reason = f"{error.reason}\n*** You may need to add PYTHONIOENCODING=utf-8 to your environment ***"
                             raise
+                else:
+                    text = self._render_buffer(render_buffer)
+                    try:
+                        self.file.write(text)
+                    except UnicodeEncodeError as error:
+                        error.reason = f"{error.reason}\n*** You may need to add PYTHONIOENCODING=utf-8 to your environment ***"
+                        raise
 
-                    self.file.flush()
-                    del self._buffer[:]
+                self.file.flush()
 
     def _render_buffer(self, buffer: Iterable[Segment]) -> str:
         """Render buffered output, and clear buffer."""
@@ -2538,12 +2755,9 @@ class Console:
                 x += cell_len(text)
 
         line_offsets = [line_no * line_height + 1.5 for line_no in range(y)]
-        lines = "\n".join(
-            f"""<clipPath id="{unique_id}-line-{line_no}">
+        lines = "\n".join(f"""<clipPath id="{unique_id}-line-{line_no}">
     {make_tag("rect", x=0, y=offset, width=char_width * width, height=line_height + 0.25)}
-            </clipPath>"""
-            for line_no, offset in enumerate(line_offsets)
-        )
+            </clipPath>""" for line_no, offset in enumerate(line_offsets))
 
         styles = "\n".join(
             f".{unique_id}-r{rule_no} {{ {css} }}" for css, rule_no in classes.items()
